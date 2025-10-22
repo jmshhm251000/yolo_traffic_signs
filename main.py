@@ -3,6 +3,7 @@ import torch, cv2
 from ultralytics import YOLO
 import yaml
 from pathlib import Path
+import albumentations as A
 
 
 def generate_data_yaml(label_path: str, output_path: Path | None = None):
@@ -15,6 +16,9 @@ def generate_data_yaml(label_path: str, output_path: Path | None = None):
     train_label_dir = root_path / "labels" / "train"
     train_img_dir = (root_path / "images" / "train").as_posix()
     val_img_dir = (root_path / "images" / "val").as_posix()
+    val_label_dir = root_path / "labels" / "val"
+
+    file_to_class = []
 
     for f in train_label_dir.rglob("*.txt"):
         try:
@@ -36,6 +40,36 @@ def generate_data_yaml(label_path: str, output_path: Path | None = None):
     max_id = max(ids)
     nc = max_id + 1
     names = [f"class_{i}" for i in range(nc)]
+
+
+    for f in val_label_dir.rglob("*.txt"):
+        try:
+            with open(f, "r") as fh:
+                for line in fh:
+                    s = line.strip()
+                    if not s or s.startswith("#"):
+                        continue
+                    cid = int(float(s.split()[0]))
+                    
+                    file_to_class.append({
+                        "file_name": f,
+                        "cid": cid
+                    })
+
+        except Exception as e:
+            print(f"[Warning] Skipping {f}: {e}")
+
+    files_by_cid_sets = [set() for _ in range(nc)]
+
+    for rec in file_to_class:
+        cid = rec["cid"]
+        if 0 <= cid < nc:
+            img_path = Path(rec["file_name"])
+            files_by_cid_sets[cid].add(img_path)
+
+    files_by_cid = [sorted(s) for s in files_by_cid_sets]
+
+    print([len(files_by_cid[cid]) for cid in range(nc)])
 
     data = {
         "train": train_img_dir,
@@ -151,6 +185,6 @@ def pred(model_path: str, input_path: str, conf: float):
 
 if __name__ == '__main__':
     generate_data_yaml('Traffic_sign_detection_data')
-    train_yolo("yolo11n.pt", 640, 20)
-    finetune_yolo("runs/detect/train/weights/best.pt", 416, 20)
-    pred("runs/detect/train3/weights/best.pt", "sample.png", 0.25)
+    #train_yolo("yolo11n.pt", 640, 20)
+    #finetune_yolo("runs/detect/train/weights/best.pt", 416, 20)
+    #pred("runs/detect/train3/weights/best.pt", "sample.png", 0.25)
