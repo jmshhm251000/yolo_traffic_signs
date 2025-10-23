@@ -1,5 +1,7 @@
-train: Traffic_sign_detection_data/images/train
-val: Traffic_sign_detection_data/images/val
+path: Traffic_sign_detection_data
+train: images/train
+val: images/val
+test: "Visual testing dataset" 
 nc: 43
 names:
 - class_0

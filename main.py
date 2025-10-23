@@ -1,10 +1,229 @@
 import os
+import random
 import torch, cv2
 from ultralytics import YOLO
+from collections import defaultdict
 import yaml
 from pathlib import Path
 import albumentations as A
 
+
+YOLO_AUG = A.Compose(
+    [
+        A.HorizontalFlip(p=0.5),
+        A.RandomBrightnessContrast(p=0.5),
+        A.HueSaturationValue(p=0.4),
+        A.MotionBlur(blur_limit=5, p=0.15),
+        A.GaussNoise(p=0.15),
+        A.Affine(scale=(0.9, 1.1), translate_percent=(0.0, 0.05),
+                 rotate=(-6, 6), shear=(-4, 4), p=0.7),
+        A.CLAHE(clip_limit=2.0, p=0.15),
+    ],
+    bbox_params=A.BboxParams(
+        format="yolo",              # (xc, yc, w, h) normalized to [0,1]
+        label_fields=["class_labels"],
+        min_visibility=0.3,         # drop boxes that get too small/hidden
+    ),
+)
+
+
+# 2) Utilities: read/write YOLO labels
+def read_yolo_labels(label_path: Path):
+    boxes, labels = [], []
+    if not label_path.exists():
+        return boxes, labels
+    with open(label_path, "r") as f:
+        for line in f:
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            parts = s.split()
+            if len(parts) != 5:
+                continue
+            cid, xc, yc, w, h = parts
+            labels.append(int(float(cid)))
+            boxes.append([float(xc), float(yc), float(w), float(h)])
+    return boxes, labels
+
+def write_yolo_labels(label_path: Path, boxes, labels):
+    label_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(label_path, "w") as f:
+        for (xc, yc, w, h), cid in zip(boxes, labels):
+            f.write(f"{cid} {xc:.6f} {yc:.6f} {w:.6f} {h:.6f}\n")
+
+# 3) Map a stem -> actual image path by extension
+_POSSIBLE_EXTS = [".jpg", ".jpeg", ".png", ".bmp", ".webp"]
+
+def stem_to_image_path(stem: str, img_dir: Path) -> Path | None:
+    for ext in _POSSIBLE_EXTS:
+        p = img_dir / f"{stem}{ext}"
+        if p.exists():
+            return p
+    return None
+
+# 4) Scan train labels into: per-class stems, and stem->class set
+def scan_train_split(train_img_dir: Path, train_label_dir: Path, nc: int):
+    files_by_cid = [set() for _ in range(nc)]  # stems per class
+    stem_to_classes = defaultdict(set)
+
+    for lbl in train_label_dir.rglob("*.txt"):
+        stem = lbl.stem
+        boxes, labels = read_yolo_labels(lbl)
+        if not labels:
+            continue
+        # add image only once per class
+        for cid in set(labels):
+            if 0 <= cid < nc:
+                files_by_cid[cid].add(stem)
+                stem_to_classes[stem].add(cid)
+
+    files_by_cid = [sorted(s) for s in files_by_cid]
+    return files_by_cid, stem_to_classes
+
+# 5) Augmentation driver
+def augment_yolo_dataset(
+    dataset_root: str | Path,
+    nc: int,
+    target_per_class: int = 1000,
+    max_aug_per_source: int = 3,
+    seed: int = 41,
+    keep_all_boxes_in_aug: bool = True,   # if False, keep only target class boxes
+    out_subdir: str | None = None,        # None -> write back into train; else "train_aug"
+):
+    """
+    Oversample minority classes in the YOLO train split using Albumentations.
+
+    Args:
+        dataset_root: dataset root that contains images/{train,val} and labels/{train,val}
+        nc: number of classes
+        target_per_class: minimum # of train images that contain each class after augmentation
+        max_aug_per_source: cap augmentations from the same original stem (avoid overfitting one image)
+        seed: RNG seed
+        keep_all_boxes_in_aug: if True, save all boxes found in augmented image
+                               if False, save only boxes of the target class (strict class-specific oversampling)
+        out_subdir: if None, write to images/train & labels/train.
+                    If set (e.g., "train_aug"), write to images/train_aug & labels/train_aug.
+    """
+    rng = random.Random(seed)
+    root = Path(dataset_root)
+    train_img_dir = root / "images" / "train"
+    train_label_dir = root / "labels" / "train"
+
+    if out_subdir:
+        out_img_dir = root / "images" / out_subdir
+        out_lbl_dir = root / "labels" / out_subdir
+    else:
+        out_img_dir = train_img_dir
+        out_lbl_dir = train_label_dir
+
+    out_img_dir.mkdir(parents=True, exist_ok=True)
+    out_lbl_dir.mkdir(parents=True, exist_ok=True)
+
+    # Scan current train split
+    files_by_cid, stem_to_classes = scan_train_split(train_img_dir, train_label_dir, nc)
+    per_class_counts = [len(v) for v in files_by_cid]
+    print(f"[info] current per-class image counts: {per_class_counts}")
+
+    total_added = 0
+
+    for cid in range(nc):
+        present = per_class_counts[cid]
+        need = max(0, target_per_class - present)
+        if need == 0:
+            print(f"[info] class {cid}: already has {present} >= {target_per_class}, skip")
+            continue
+
+        candidates = files_by_cid[cid][:]
+        if not candidates:
+            print(f"[warn] class {cid}: no source images; cannot augment")
+            continue
+
+        rng.shuffle(candidates)
+        used_times: dict[str, int] = {}
+        augmented_for_cid = 0
+        i = 0
+
+        print(f"[info] augmenting class {cid}: need {need} more")
+
+        # Incremental unique naming across class to avoid clashes
+        uid_counter = 0
+
+        while augmented_for_cid < need and candidates:
+            stem = candidates[i % len(candidates)]
+            used_times[stem] = used_times.get(stem, 0)
+
+            if used_times[stem] >= max_aug_per_source:
+                i += 1
+                # simple escape hatch to avoid infinite loops if all capped
+                if i > len(candidates) * (max_aug_per_source + 2):
+                    break
+                continue
+
+            img_path = stem_to_image_path(stem, train_img_dir)
+            if img_path is None:
+                i += 1
+                continue
+
+            lbl_path = train_label_dir / f"{stem}.txt"
+            boxes, labels = read_yolo_labels(lbl_path)
+            if not boxes:
+                i += 1
+                continue
+
+            # Load image (BGR)
+            img = cv2.imread(str(img_path))
+            if img is None:
+                i += 1
+                continue
+
+            # Albumentations expects bboxes + label_fields
+            class_labels = labels[:]
+            aug = YOLO_AUG(image=img, bboxes=boxes, class_labels=class_labels)
+            aug_img, aug_boxes, aug_labels = aug["image"], aug["bboxes"], aug["class_labels"]
+
+            if not aug_boxes:
+                # nothing survived min_visibility/transform—skip
+                i += 1
+                continue
+
+            if not keep_all_boxes_in_aug:
+                # keep only target class boxes
+                keep = [(b, l) for (b, l) in zip(aug_boxes, aug_labels) if l == cid]
+                if not keep:
+                    i += 1
+                    continue
+                aug_boxes, aug_labels = list(zip(*keep))
+                aug_boxes, aug_labels = list(aug_boxes), list(aug_labels)
+
+            # Save with unique name
+            new_name = f"{stem}_aug_c{cid}_{uid_counter}"
+            uid_counter += 1
+
+            out_img_path = out_img_dir / f"{new_name}.jpg"
+            out_lbl_path = out_lbl_dir / f"{new_name}.txt"
+
+            cv2.imwrite(str(out_img_path), aug_img)
+            write_yolo_labels(out_lbl_path, aug_boxes, aug_labels)
+
+            augmented_for_cid += 1
+            total_added += 1
+            used_times[stem] += 1
+            i += 1
+
+        print(f"[info] class {cid}: added {augmented_for_cid} augmented images")
+
+    print(f"[done] augmentation complete. Total new images: {total_added}")
+    # Optional: re-scan to show new counts (if writing back into train)
+    if out_subdir is None:
+        new_files_by_cid, _ = scan_train_split(train_img_dir, train_label_dir, nc)
+        print("[info] new per-class image counts:",
+              [len(v) for v in new_files_by_cid])
+    else:
+        # If you wrote to train_aug, show counts for that folder only
+        aug_files_by_cid, _ = scan_train_split(out_img_dir, out_lbl_dir, nc)
+        print("[info] per-class counts in", out_subdir, ":",
+              [len(v) for v in aug_files_by_cid])
+        
 
 def generate_data_yaml(label_path: str, output_path: Path | None = None):
     if os.path.exists("data.yaml"):
@@ -185,6 +404,15 @@ def pred(model_path: str, input_path: str, conf: float):
 
 if __name__ == '__main__':
     generate_data_yaml('Traffic_sign_detection_data')
-    #train_yolo("yolo11n.pt", 640, 20)
-    #finetune_yolo("runs/detect/train/weights/best.pt", 416, 20)
-    #pred("runs/detect/train3/weights/best.pt", "sample.png", 0.25)
+    augment_yolo_dataset(
+        dataset_root='Traffic_sign_detection_data',
+        nc=43,
+        target_per_class=200,
+        max_aug_per_source=20,
+        seed=41,
+        keep_all_boxes_in_aug=True,   # set False to keep only the target class boxes
+        out_subdir=None               # or 'train_aug'
+    )
+    train_yolo("yolo11n.pt", 640, 20)
+    finetune_yolo("runs/detect/train/weights/best.pt", 416, 20)
+    pred("runs/detect/train3/weights/best.pt", "sample.png", 0.25)
