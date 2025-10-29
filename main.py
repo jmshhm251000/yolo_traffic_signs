@@ -1,11 +1,14 @@
 import os
-import random
+import random, time, json
+import numpy as np
 import torch, cv2
 from ultralytics import YOLO
 from collections import defaultdict
 import yaml
 from pathlib import Path
 import albumentations as A
+from sklearn.metrics import (precision_recall_fscore_support, average_precision_score,
+                                 roc_auc_score)
 
 
 YOLO_AUG = A.Compose(
@@ -402,17 +405,454 @@ def pred(model_path: str, input_path: str, conf: float):
     return r  # return the first (or retried) result object
 
 
+def model_metrics(model_path: str,
+                  imgsz: int,
+                  data_yaml: str = "sign.yaml",   # ← 원하는 YAML 경로로 바꿔 호출
+                  iou_thr: float = 0.50,
+                  ece_bins: int = 15,
+                  stress_max_imgs: int = 150,
+                  conf_infer: float = 0.001,      # low conf to collect *all* candidates
+                  conf_eval: float | None = None, # set e.g. 0.45 to match YOLO plot
+                  do_sweep: bool = True) -> dict:
+    """
+    Evaluate on the *val/valid* split defined in `data_yaml` (e.g., sign.yaml).
+    Computes:
+      - Top-1/Top-3 image-level class presence accuracy
+      - Precision/Recall/F1 (micro & macro, fixed IoU threshold)
+      - PR-AUC (per-class & macro)
+      - ROC-AUC (approx; non-standard for detection)
+      - Calibration: ECE, Brier score
+      - Efficiency: latency, throughput, model size
+      - Stress test: subset mAP50 under corruptions (noise/blur/brightness-contrast)
+    Returns: JSON-serializable dict
+    """
+    import os, time, yaml, cv2
+    import numpy as np
+    from pathlib import Path
+    from collections import defaultdict
+    from ultralytics import YOLO
+    from sklearn.metrics import average_precision_score, roc_auc_score
+
+    # ---------- small helpers ----------
+    def load_yaml(p):
+        with open(p, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f)
+
+    def list_images(img_dir: Path):
+        exts = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
+        return sorted([p for p in img_dir.rglob("*") if p.suffix.lower() in exts])
+
+    def yolo_to_xyxy(xc, yc, w, h, W, H):
+        return [(xc - w/2) * W, (yc - h/2) * H, (xc + w/2) * W, (yc + h/2) * H]
+
+    def read_gt_label(lbl_path: Path, W: int, H: int):
+        boxes, classes = [], []
+        if not lbl_path.exists():
+            return np.zeros((0,4), np.float32), np.zeros((0,), np.int32)
+        with open(lbl_path, "r") as f:
+            for line in f:
+                s = line.strip()
+                if not s or s.startswith("#"): continue
+                cid, xc, yc, w, h = s.split()
+                boxes.append(yolo_to_xyxy(float(xc), float(yc), float(w), float(h), W, H))
+                classes.append(int(float(cid)))
+        return np.array(boxes, np.float32), np.array(classes, np.int32)
+
+    def iou_matrix(a, b):
+        if a.size == 0 or b.size == 0:
+            return np.zeros((len(a), len(b)), np.float32)
+        ax1, ay1, ax2, ay2 = a[:,0], a[:,1], a[:,2], a[:,3]
+        bx1, by1, bx2, by2 = b[:,0], b[:,1], b[:,2], b[:,3]
+        inter_x1 = np.maximum(ax1[:,None], bx1[None,:])
+        inter_y1 = np.maximum(ay1[:,None], by1[None,:])
+        inter_x2 = np.minimum(ax2[:,None], bx2[None,:])
+        inter_y2 = np.minimum(ay2[:,None], by2[None,:])
+        inter_w  = np.maximum(0.0, inter_x2 - inter_x1)
+        inter_h  = np.maximum(0.0, inter_y2 - inter_y1)
+        inter    = inter_w * inter_h
+        area_a   = (ax2 - ax1) * (ay2 - ay1)
+        area_b   = (bx2 - bx1) * (by2 - by1)
+        union    = area_a[:,None] + area_b[None,:] - inter
+        return np.where(union > 0, inter / union, 0.0)
+
+    def greedy_match(p_xyxy, p_conf, p_cls, g_xyxy, g_cls, thr):
+        P, G = len(p_xyxy), len(g_xyxy)
+        if P == 0:
+            return np.zeros(0, bool), np.zeros(G, bool)
+        if G == 0:
+            return np.zeros(P, bool), np.zeros(0, bool)
+        order = np.argsort(-p_conf)
+        p_xyxy = p_xyxy[order]; p_cls = p_cls[order]
+        tp = np.zeros(P, bool); gt_taken = np.zeros(G, bool)
+        for i in range(P):
+            c = p_cls[i]
+            m = (g_cls == c)
+            if not np.any(m): continue
+            ious = iou_matrix(p_xyxy[i:i+1], g_xyxy[m])[0]
+            cand_idx = np.where(m)[0]
+            free = ~gt_taken[cand_idx]
+            if not np.any(free): continue
+            ious = ious[free]; cand_idx = cand_idx[free]
+            if ious.size == 0: continue
+            j = np.argmax(ious)
+            if ious[j] >= thr:
+                tp[i] = True
+                gt_taken[cand_idx[j]] = True
+        inv = np.empty_like(order); inv[order] = np.arange(P)
+        return tp[inv], gt_taken
+
+    def brier_score(conf, tp_flags):
+        if len(conf) == 0: return None
+        y = tp_flags.astype(np.float32)
+        return float(np.mean((conf - y)**2))
+
+    def expected_calibration_error(conf, tp_flags, n_bins=15):
+        if len(conf) == 0: return None
+        conf = np.asarray(conf, np.float32); y = tp_flags.astype(np.float32)
+        bins = np.linspace(0,1,n_bins+1); N = len(conf); ece = 0.0
+        for i in range(n_bins):
+            m = (conf >= bins[i]) & (conf < (bins[i+1] if i < n_bins-1 else bins[i+1]))
+            if not np.any(m): continue
+            acc = np.mean(y[m]); cbar = np.mean(conf[m]); ece += (np.sum(m)/N)*abs(acc-cbar)
+        return float(ece)
+    
+    def prf_at_threshold(per_image_preds, per_image_gts, thr: float, iou_thr: float, nc: int):
+        # micro accumulators
+        TP=FP=FN=0
+        # macro accumulators per class
+        tp_c = np.zeros(nc, dtype=int)
+        fp_c = np.zeros(nc, dtype=int)
+        fn_c = np.zeros(nc, dtype=int)
+
+        for pred, gt in zip(per_image_preds, per_image_gts):
+            p_xyxy, p_cls, p_conf = pred["xyxy"], pred["cls"], pred["conf"]
+            keep = (p_conf >= thr)
+            p_xyxy, p_cls, p_conf = p_xyxy[keep], p_cls[keep], p_conf[keep]
+
+            tp_flags, gt_taken = greedy_match(p_xyxy, p_conf, p_cls, gt["xyxy"], gt["cls"], iou_thr)
+
+            # --- micro ---
+            TP += int(tp_flags.sum())
+            FP += int((~tp_flags).sum())
+            FN += int(max(len(gt["cls"]) - gt_taken.sum(), 0))
+
+            # --- macro per class ---
+            for c in range(nc):
+                # predictions of class c at this threshold
+                m_pred_c = (p_cls == c)
+                if m_pred_c.any():
+                    tp_c[c] += int(tp_flags[m_pred_c].sum())
+                    fp_c[c] += int((~tp_flags[m_pred_c]).sum())
+                # ground truths of class c for this image
+                m_gt_c = (gt["cls"] == c)
+                if m_gt_c.any():
+                    # fn = gt of class c not taken
+                    fn_c[c] += int((~gt_taken[m_gt_c]).sum())
+
+        # micro P/R/F1
+        P_micro = TP/(TP+FP) if TP+FP>0 else 0.0
+        R_micro = TP/(TP+FN) if TP+FN>0 else 0.0
+        F1_micro = (2*P_micro*R_micro/(P_micro+R_micro)) if (P_micro+R_micro)>0 else 0.0
+
+        # macro P/R/F1 (unweighted mean of per-class)
+        P_macro_list, R_macro_list, F1_macro_list = [], [], []
+        for c in range(nc):
+            Pc = tp_c[c]/(tp_c[c]+fp_c[c]) if (tp_c[c]+fp_c[c])>0 else 0.0
+            Rc = tp_c[c]/(tp_c[c]+fn_c[c]) if (tp_c[c]+fn_c[c])>0 else 0.0
+            F1c = (2*Pc*Rc/(Pc+Rc)) if (Pc+Rc)>0 else 0.0
+            P_macro_list.append(Pc); R_macro_list.append(Rc); F1_macro_list.append(F1c)
+
+        P_macro = float(np.mean(P_macro_list)) if P_macro_list else 0.0
+        R_macro = float(np.mean(R_macro_list)) if R_macro_list else 0.0
+        F1_macro = float(np.mean(F1_macro_list)) if F1_macro_list else 0.0
+
+        return (P_micro, R_micro, F1_micro, TP, FP, FN,
+                P_macro, R_macro, F1_macro)
+
+    def sweep_best_f1(per_image_preds, per_image_gts, iou_thr: float, nc: int):
+        thresholds = np.linspace(0.0, 1.0, 201)
+        best = {
+            "conf": 0.0,
+            "micro": {"precision": 0.0, "recall": 0.0, "f1": 0.0, "TP": 0, "FP": 0, "FN": 0},
+            "macro": {"precision": 0.0, "recall": 0.0, "f1": 0.0}
+        }
+        best_f1 = 0.0
+        for t in thresholds:
+            (Pmi, Rmi, F1mi, TP, FP, FN, Pma, Rma, F1ma) = prf_at_threshold(
+                per_image_preds, per_image_gts, t, iou_thr, nc
+            )
+            if F1mi > best_f1:
+                best_f1 = F1mi
+                best = {
+                    "conf": float(t),
+                    "micro": {"precision": float(Pmi), "recall": float(Rmi), "f1": float(F1mi),
+                            "TP": int(TP), "FP": int(FP), "FN": int(FN)},
+                    "macro": {"precision": float(Pma), "recall": float(Rma), "f1": float(F1ma)}
+                }
+        return best
+
+    # read YAML (sign.yaml) 
+    data_cfg = load_yaml(data_yaml)
+    train_img_dir = Path(data_cfg["train"])
+    val_img_dir   = Path(data_cfg.get("val") or data_cfg.get("valid") or data_cfg.get("validation"))
+    # Roboflow : ".../valid/images" → ".../valid/labels"
+    if "images" in str(val_img_dir):
+        val_lbl_dir = Path(str(val_img_dir).replace("\\images", "\\labels").replace("/images", "/labels"))
+    else:
+        # data.yaml: path + images/val ↔ labels/val
+        val_lbl_dir = Path(str(val_img_dir).replace("/images/", "/labels/"))
+    nc    = int(data_cfg["nc"])
+    names = data_cfg.get("names", [f"class_{i}" for i in range(nc)])
+
+    val_imgs = list_images(val_img_dir)
+    if len(val_imgs) == 0:
+        raise RuntimeError(f"No validation images found under: {val_img_dir}")
+
+    # model 
+    device = 0 if torch.cuda.is_available() else "cpu"
+    model  = YOLO(model_path)
+
+    per_image_preds = []  # each: {"xyxy": (N,4), "cls": (N,), "conf": (N,)}
+    per_image_gts   = []  # each: {"xyxy": (M,4), "cls": (M,)}
+
+
+    # sweep once over clean val
+    per_cls_scores = [[] for _ in range(nc)]
+    per_cls_hits   = [[] for _ in range(nc)]
+    gt_pos_counts  = np.zeros(nc, int)
+
+    per_img_presence_top = []  # (set(gt classes), {cls: max_conf_in_img})
+
+    lat_ms = []
+    TP=FP=FN=0
+
+    for img_path in val_imgs:
+        img = cv2.imread(str(img_path))
+        if img is None: continue
+        H,W = img.shape[:2]
+        lbl = val_lbl_dir / img_path.with_suffix(".txt").name
+        g_xyxy, g_cls = read_gt_label(lbl, W, H)
+        for c in g_cls.tolist():
+            if 0 <= c < nc: gt_pos_counts[c] += 1
+
+        t1 = time.time()
+        pred = model.predict(source=str(img_path), imgsz=imgsz, conf=conf_infer, iou=0.70,
+                             device=device, verbose=False, agnostic_nms=False)[0]
+        t2 = time.time()
+        lat_ms.append((t2-t1)*1000)
+
+        if pred.boxes is not None and len(pred.boxes):
+            p_xyxy = pred.boxes.xyxy.cpu().numpy().astype(np.float32)
+            p_cls  = pred.boxes.cls.cpu().numpy().astype(np.int32)
+            p_conf = pred.boxes.conf.cpu().numpy().astype(np.float32)
+        else:
+            p_xyxy = np.zeros((0,4), np.float32)
+            p_cls  = np.zeros((0,), np.int32)
+            p_conf = np.zeros((0,), np.float32)
+
+        per_image_preds.append({"xyxy": p_xyxy, "cls": p_cls, "conf": p_conf})
+        per_image_gts.append({"xyxy": g_xyxy, "cls": g_cls})
+
+        tp_flags, gt_taken = greedy_match(p_xyxy, p_conf, p_cls, g_xyxy, g_cls, iou_thr)
+
+        # detection-level accumulators
+        for c in range(nc):
+            m = (p_cls == c)
+            if np.any(m):
+                per_cls_scores[c].extend(p_conf[m].tolist())
+                per_cls_hits[c].extend(tp_flags[m].astype(int).tolist())
+
+        TP += int(tp_flags.sum())
+        FP += int((~tp_flags).sum())
+        FN += int(max(len(g_cls) - gt_taken.sum(), 0))
+
+        # image-level class presence conf map (for top-k)
+        confmap = defaultdict(float)
+        for c in range(nc):
+            if np.any(p_cls == c):
+                confmap[c] = float(np.max(p_conf[p_cls==c]))
+        per_img_presence_top.append((set(g_cls.tolist()), confmap))
+
+    # efficiency
+    avg_latency_ms = float(np.mean(lat_ms)) if lat_ms else None
+    throughput_fps = float(1000.0/avg_latency_ms) if avg_latency_ms and avg_latency_ms>0 else None
+    try:
+        model_size_mb = os.path.getsize(model_path)/(1024*1024)
+    except Exception:
+        model_size_mb = None
+
+    # micro P/R/F1
+    prec_micro = TP/(TP+FP) if TP+FP>0 else 0.0
+    rec_micro  = TP/(TP+FN) if TP+FN>0 else 0.0
+    f1_micro   = (2*prec_micro*rec_micro/(prec_micro+rec_micro)) if (prec_micro+rec_micro)>0 else 0.0
+
+    # macro P/R/F1 and PR-AUC/ROC-AUC (approx)
+    macro_prec_list=[]; macro_rec_list=[]; macro_f1_list=[]
+    pr_auc_values=[]; roc_auc_values=[]
+    for c in range(nc):
+        y_scores = np.array(per_cls_scores[c], np.float32)
+        y_true   = np.array(per_cls_hits[c],   np.int32)  # 1=TP / 0=FP
+        P        = int(gt_pos_counts[c])
+
+        tp_c = int(y_true.sum())
+        fp_c = int(len(y_true)-tp_c)
+        fn_c = int(max(P - tp_c, 0))
+        prec_c = tp_c/(tp_c+fp_c) if (tp_c+fp_c)>0 else 0.0
+        rec_c  = tp_c/(tp_c+fn_c) if (tp_c+fn_c)>0 else 0.0
+        f1_c   = (2*prec_c*rec_c/(prec_c+rec_c)) if (prec_c+rec_c)>0 else 0.0
+        macro_prec_list.append(prec_c); macro_rec_list.append(rec_c); macro_f1_list.append(f1_c)
+
+        # AP (PR-AUC)
+        ap_c = None
+        if len(y_scores)>0 and P>0 and len(np.unique(y_true))>1:
+            try:
+                ap_c = average_precision_score(y_true, y_scores)
+            except Exception:
+                ap_c = None
+        pr_auc_values.append(ap_c)
+
+        # ROC-AUC (approx; non-standard for detection)
+        roc_c = None
+        if len(np.unique(y_true))>1:
+            try:
+                roc_c = roc_auc_score(y_true, y_scores)
+            except Exception:
+                roc_c = None
+        roc_auc_values.append(roc_c)
+
+    prec_macro = float(np.mean(macro_prec_list)) if macro_prec_list else 0.0
+    rec_macro  = float(np.mean(macro_rec_list))  if macro_rec_list else 0.0
+    f1_macro   = float(np.mean(macro_f1_list))   if macro_f1_list else 0.0
+    pr_auc_macro = float(np.nanmean([v for v in pr_auc_values if v is not None])) if any(v is not None for v in pr_auc_values) else None
+    roc_auc_macro = float(np.nanmean([v for v in roc_auc_values if v is not None])) if any(v is not None for v in roc_auc_values) else None
+
+    # calibration (detections all classes)
+    all_scores = np.concatenate([np.array(per_cls_scores[c], np.float32) for c in range(nc)]) if nc>0 else np.array([])
+    all_hits   = np.concatenate([np.array(per_cls_hits[c],   np.int32)   for c in range(nc)]) if nc>0 else np.array([])
+    ece   = expected_calibration_error(all_scores, all_hits, n_bins=ece_bins) if len(all_scores) else None
+    brier = brier_score(all_scores, all_hits) if len(all_scores) else None
+
+    # top-k image-level presence
+    def top_k_accuracy(per_img, K):
+        correct = 0; total = 0
+        for present, confmap in per_img:
+            if not present: continue
+            total += len(present)
+            topK = [] if len(confmap)==0 else [c for c,_ in sorted(confmap.items(), key=lambda x:-x[1])[:K]]
+            correct += sum(1 for c in present if c in topK)
+        return correct/total if total>0 else 0.0
+    top1 = top_k_accuracy(per_img_presence_top, 1)
+    top3 = top_k_accuracy(per_img_presence_top, 3)
+
+    # quick stress test on subset
+    import albumentations as A
+    CORR = {
+        "gauss_noise": A.GaussNoise(p=1.0),           # 일부 버전에서 var_limit 경고 → 기본값 사용
+        "motion_blur": A.MotionBlur(blur_limit=7, p=1.0),
+        "brightness_contrast": A.RandomBrightnessContrast(0.3, 0.3, p=1.0),
+    }
+
+    def eval_subset(imgs, tfm=None, max_n=stress_max_imgs):
+        from sklearn.metrics import average_precision_score
+        per_s = [[] for _ in range(nc)]
+        per_h = [[] for _ in range(nc)]
+        gt_cnt = np.zeros(nc, int)
+        cnt = 0
+        for ip in imgs:
+            if cnt >= max_n: break
+            im = cv2.imread(str(ip))
+            if im is None: continue
+            H,W = im.shape[:2]
+            lbl = val_lbl_dir / ip.with_suffix(".txt").name
+            g_xyxy, g_cls = read_gt_label(lbl, W, H)
+            for c in g_cls.tolist():
+                if 0 <= c < nc: gt_cnt[c] += 1
+            if tfm is not None:
+                im = tfm(image=im)["image"]
+            pred = model.predict(source=im, imgsz=imgsz, conf=0.001, iou=0.70,
+                                 device=device, verbose=False, agnostic_nms=False)[0]
+            if pred.boxes is not None and len(pred.boxes):
+                p_xyxy = pred.boxes.xyxy.cpu().numpy().astype(np.float32)
+                p_cls  = pred.boxes.cls.cpu().numpy().astype(np.int32)
+                p_conf = pred.boxes.conf.cpu().numpy().astype(np.float32)
+            else:
+                p_xyxy = np.zeros((0,4), np.float32)
+                p_cls  = np.zeros((0,), np.int32)
+                p_conf = np.zeros((0,), np.float32)
+            tpf, _ = greedy_match(p_xyxy, p_conf, p_cls, g_xyxy, g_cls, iou_thr)
+            for c in range(nc):
+                m = (p_cls == c)
+                if np.any(m):
+                    per_s[c].extend(p_conf[m].tolist())
+                    per_h[c].extend(tpf[m].astype(int).tolist())
+            cnt += 1
+        aps = []
+        for c in range(nc):
+            ys = np.array(per_s[c], np.float32); yt = np.array(per_h[c], np.int32)
+            if len(ys)>0 and gt_cnt[c]>0 and len(np.unique(yt))>1:
+                try:
+                    aps.append(average_precision_score(yt, ys))
+                except Exception:
+                    pass
+        return float(np.mean(aps)) if aps else None
+
+    subset = val_imgs[:min(len(val_imgs), stress_max_imgs)]
+    base_map50 = eval_subset(subset, None, stress_max_imgs)
+    stress = {}
+    for name, aug in CORR.items():
+        m = eval_subset(subset, A.Compose([aug]), stress_max_imgs)
+        stress[name] = {"mAP50_subset": m, "delta_vs_clean": (m - base_map50) if (m is not None and base_map50 is not None) else None}
+
+
+    #add operating-point metrics and best-over-sweep
+    if conf_eval is not None:
+        Pmi, Rmi, F1mi, TP_e, FP_e, FN_e, Pma, Rma, F1ma = prf_at_threshold(
+            per_image_preds, per_image_gts, conf_eval, iou_thr, nc
+        )
+        operating_point = {
+            "conf_eval": float(conf_eval),
+            "micro": {"precision": Pmi, "recall": Rmi, "f1": F1mi, "TP": TP_e, "FP": FP_e, "FN": FN_e},
+            "macro": {"precision": Pma, "recall": Rma, "f1": F1ma}
+        }
+
+    sweep_best = sweep_best_f1(per_image_preds, per_image_gts, iou_thr, nc) if do_sweep else None
+
+    return {
+        "overall": {"top1_accuracy_presence": top1, "top3_accuracy_presence": top3},
+        "precision_recall_f1": {
+            "micro": {"precision": prec_micro, "recall": rec_micro, "f1": f1_micro},
+            "macro": {"precision": prec_macro, "recall": rec_macro, "f1": f1_macro}
+        },
+        "pr_auc": {"per_class": pr_auc_values, "macro": (float(np.nanmean([v for v in pr_auc_values if v is not None])) if any(v is not None for v in pr_auc_values) else None)},
+        "roc_auc_approx": {"per_class": roc_auc_values, "macro": roc_auc_macro, "note": "ROC on detection confidences is non-standard; compare with PR-AUC."},
+        "calibration": {"ece": ece, "brier": brier, "bins": ece_bins},
+        "efficiency": {"avg_latency_ms_per_image": avg_latency_ms, "throughput_fps": throughput_fps, "model_size_mb": model_size_mb},
+        "stress_test": {"baseline_subset_mAP50": base_map50, "corruptions": stress, "subset_size": len(subset)},
+        "operating_point": operating_point,
+        "sweep_best": sweep_best,   
+        "meta": {"images_evaluated": len(val_imgs), "iou_thr": iou_thr, "imgsz": imgsz, "device": ("cuda" if torch.cuda.is_available() else "cpu"), "nc": nc, "names": names, "data_yaml": str(Path(data_yaml).resolve())}
+    }
+
+
 if __name__ == '__main__':
-    generate_data_yaml('Traffic_sign_detection_data')
-    augment_yolo_dataset(
-        dataset_root='Traffic_sign_detection_data',
-        nc=43,
-        target_per_class=200,
-        max_aug_per_source=20,
-        seed=41,
-        keep_all_boxes_in_aug=True,   # set False to keep only the target class boxes
-        out_subdir=None               # or 'train_aug'
+    # generate_data_yaml('Traffic_sign_detection_data')
+    # augment_yolo_dataset(
+    #     dataset_root='Traffic_sign_detection_data',
+    #     nc=43,
+    #     target_per_class=200,
+    #     max_aug_per_source=20,
+    #     seed=41,
+    #     keep_all_boxes_in_aug=True,   # set False to keep only the target class boxes
+    #     out_subdir=None               # or 'train_aug'
+    # )
+    # train_yolo("yolo11n.pt", 640, 20)
+    # finetune_yolo("runs/detect/train/weights/best.pt", 416, 20)
+    # pred("runs/detect/train3/weights/best.pt", "road.PNG", 0.25)
+    metrics_json = model_metrics(
+        model_path="runs/detect/train3/weights/best.pt",
+        imgsz=416,
+        data_yaml="sign.yaml",
+        conf_eval=0.49
     )
-    train_yolo("yolo11n.pt", 640, 20)
-    finetune_yolo("runs/detect/train/weights/best.pt", 416, 20)
-    pred("runs/detect/train3/weights/best.pt", "sample.png", 0.25)
+    with open("metrics.json", "w") as f:
+        json.dump(metrics_json, f, indent=2)
