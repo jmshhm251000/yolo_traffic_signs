@@ -7,8 +7,7 @@ from collections import defaultdict
 import yaml
 from pathlib import Path
 import albumentations as A
-from sklearn.metrics import (precision_recall_fscore_support, average_precision_score,
-                                 roc_auc_score)
+from sklearn.metrics import (precision_recall_fscore_support, average_precision_score, roc_auc_score)
 
 
 YOLO_AUG = A.Compose(
@@ -835,19 +834,19 @@ def model_metrics(model_path: str,
 
 
 if __name__ == '__main__':
-    # generate_data_yaml('Traffic_sign_detection_data')
-    # augment_yolo_dataset(
-    #     dataset_root='Traffic_sign_detection_data',
-    #     nc=43,
-    #     target_per_class=200,
-    #     max_aug_per_source=20,
-    #     seed=41,
-    #     keep_all_boxes_in_aug=True,   # set False to keep only the target class boxes
-    #     out_subdir=None               # or 'train_aug'
-    # )
-    # train_yolo("yolo11n.pt", 640, 20)
-    # finetune_yolo("runs/detect/train/weights/best.pt", 416, 20)
-    # pred("runs/detect/train3/weights/best.pt", "road.PNG", 0.25)
+    generate_data_yaml('Traffic_sign_detection_data')
+    augment_yolo_dataset(
+        dataset_root='Traffic_sign_detection_data',
+        nc=43,
+        target_per_class=200,
+        max_aug_per_source=20,
+        seed=41,
+        keep_all_boxes_in_aug=True,   # set False to keep only the target class boxes
+        out_subdir=None               # or 'train_aug'
+    )
+    train_yolo("yolo11n.pt", 640, 20)
+    finetune_yolo("runs/detect/train/weights/best.pt", 416, 20)
+    pred("runs/detect/train3/weights/best.pt", "road.PNG", 0.25)
     metrics_json = model_metrics(
         model_path="runs/detect/train3/weights/best.pt",
         imgsz=416,
